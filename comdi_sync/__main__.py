@@ -10,16 +10,53 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import socket
 import sys
 import time
+
+from datetime import datetime, timedelta, timezone
 
 from .comdi import ComdiClient
 from .config import load_config, setup_logging
 from .eventicious import EventiciousClient
+from .notify import TelegramNotifier
 from .state import State
 from .sync import Syncer
 
 log = logging.getLogger("comdi_sync")
+
+
+def _alert_allowed(state, kind: str, cooldown_hours: int) -> bool:
+    """Анти-спам: повторяем уведомление об одной ошибке не чаще cooldown_hours."""
+    last = state.last_alert_at(kind)
+    if last is None:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(last).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    return datetime.now(timezone.utc) - last_dt >= timedelta(hours=cooldown_hours)
+
+
+def _notify_failure(cfg, state, kind: str, message: str) -> None:
+    """Отправить уведомление в Telegram (если настроено) и отметить его в state."""
+    notifier = TelegramNotifier(cfg.telegram_bot_token, cfg.telegram_chat_id)
+    if not notifier.enabled:
+        return
+    if not _alert_allowed(state, kind, cfg.alert_cooldown_hours):
+        log.info("Уведомление '%s' подавлено (повтор в пределах cooldown)", kind)
+        return
+    host = "GitHub Actions" if os.environ.get("GITHUB_ACTIONS") == "true" else socket.gethostname()
+    text = (
+        f"⚠️ <b>Comdi → Eventicious: сбой синхронизации</b>\n"
+        f"Хост: {host}\n"
+        f"Тип: {kind}\n"
+        f"Время (UTC): {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}\n\n"
+        f"<code>{message[:1500]}</code>"
+    )
+    if notifier.send(text):
+        state.mark_alert(kind)
 
 
 def cmd_once(cfg, syncer, state) -> int:
@@ -27,10 +64,13 @@ def cmd_once(cfg, syncer, state) -> int:
         stats = syncer.run_once()
         state.log("ok" if not stats.get("failed") else "partial", json.dumps(stats, ensure_ascii=False))
         # частичный результат — тоже сигнал ненулевого кода для cron/мониторинга
+        if stats.get("failed"):
+            _notify_failure(cfg, state, "partial", f"Часть объектов не синхронизировалась: {stats}")
         return 1 if stats.get("failed") else 0
     except Exception as exc:  # noqa: BLE001 — фиксируем любой сбой и отдаём ненулевой код
         log.exception("Синхронизация не удалась")
         state.log("error", repr(exc))
+        _notify_failure(cfg, state, "error", repr(exc))
         return 1
 
 

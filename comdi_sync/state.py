@@ -124,3 +124,14 @@ class State:
             "INSERT INTO sync_log(status, detail) VALUES(?,?)", (status, detail[:4000])
         )
         self._conn.commit()
+
+    def last_alert_at(self, kind: str) -> str | None:
+        """Когда последний раз уходило уведомление данного вида (UTC, ISO) или None."""
+        cur = self._conn.execute(
+            "SELECT MAX(started_at) FROM sync_log WHERE status=?", (f"alert:{kind}",)
+        )
+        row = cur.fetchone()
+        return str(row[0]) if row and row[0] else None
+
+    def mark_alert(self, kind: str) -> None:
+        self.log(f"alert:{kind}")

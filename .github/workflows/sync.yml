@@ -47,6 +47,10 @@ jobs:
           ID_OFFSET_USER: "400000"
           STATE_DB: sync_state.sqlite3
           LOG_LEVEL: INFO
+          # Telegram-уведомления о сбоях
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ALERT_COOLDOWN_HOURS: "6"
         run: python -m comdi_sync once
 
       # состояние (маппинг ID + хэши) — единственный артефакт, который должен

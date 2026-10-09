@@ -56,12 +56,19 @@ class Config:
     offset_session: int = _env_int("ID_OFFSET_SESSION", 300_000)
     offset_user: int = _env_int("ID_OFFSET_USER", 400_000)
 
+    # Telegram-уведомления о сбоях (пустые строки = выключены)
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+
     state_db: str = os.getenv("STATE_DB", "sync_state.sqlite3")
 
     http_timeout: int = _env_int("HTTP_TIMEOUT", 30)
     max_retries: int = _env_int("MAX_RETRIES", 4)
 
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
+
+    # не чаще, чем раз в N часов слать одно и то же Telegram-уведомление о сбое
+    alert_cooldown_hours: int = _env_int("ALERT_COOLDOWN_HOURS", 6)
 
     def __post_init__(self) -> None:
         pass  # проверка кредов — в main(), чтобы dry-run работал без них
