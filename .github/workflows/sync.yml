@@ -1,0 +1,65 @@
+name: comdi → eventicious sync
+
+on:
+  schedule:
+    # каждые 15 минут, по гринвичу (UTC)
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {} # ручной запуск из вкладки Actions
+
+# один прогон за раз, без параллельных дублей
+concurrency:
+  group: comdi-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write # нужно, чтобы коммитить обновлённое состояние обратно
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Установка зависимостей
+        run: pip install -r requirements.txt
+
+      - name: Синхронизация
+        env:
+          # секреты (задаются в Settings → Secrets and variables → Actions)
+          COMDI_EVENT_URL: ${{ secrets.COMDI_EVENT_URL }}
+          EVENTICIOUS_BASE_URL: ${{ secrets.EVENTICIOUS_BASE_URL }}
+          EVENTICIOUS_CLIENT_ID: ${{ secrets.EVENTICIOUS_CLIENT_ID }}
+          EVENTICIOUS_CLIENT_SECRET: ${{ secrets.EVENTICIOUS_CLIENT_SECRET }}
+          # не-секретные настройки — значения по умолчанию из .env.example
+          EVENT_TIMEZONE: Europe/Moscow
+          SYNC_INTERVAL_SECONDS: "300"
+          DELETE_REMOVED: "true"
+          SYNC_EN: "true"
+          ID_OFFSET_LOCATION: "100000"
+          ID_OFFSET_TAG: "200000"
+          ID_OFFSET_SESSION: "300000"
+          ID_OFFSET_USER: "400000"
+          STATE_DB: sync_state.sqlite3
+          LOG_LEVEL: INFO
+        run: python -m comdi_sync once
+
+      # состояние (маппинг ID + хэши) — единственный артефакт, который должен
+      # переживать между запусками: храним его прямо в репозитории
+      - name: Сохранить состояние
+        if: always() && github.ref == 'refs/heads/main'
+        run: |
+          git config user.name "comdi-sync[bot]"
+          git config user.email "comdi-sync@users.noreply.github.com"
+          git add -f sync_state.sqlite3
+          if git diff --cached --quiet; then
+            echo "состояние не изменилось"
+            exit 0
+          fi
+          git commit -m "sync: состояние $(date -u +%FT%TZ)"
+          git push

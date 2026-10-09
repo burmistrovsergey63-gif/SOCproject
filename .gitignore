@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.sqlite3
+.env
+sync.log
+
+# артефакты запусков
+launchd.log
+f*.log
+r*.log
+comdi-sync-*.zip
