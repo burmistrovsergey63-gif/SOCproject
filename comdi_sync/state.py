@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS objects (
     source_id  INTEGER NOT NULL,-- id в Comdi
     target_id  INTEGER NOT NULL,-- id, который мы передали в Eventicious
     content_hash TEXT NOT NULL, -- хэш последнего успешно отправленного состояния
+    content_payload TEXT,       -- полный payload для планирования переносов
     en_hash TEXT,               -- хэш отправленной EN-версии (NULL = ещё не ушла)
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (entity, source_id)
@@ -91,6 +92,9 @@ class State:
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(objects)")}
         if "en_hash" not in cols:
             self._conn.execute("ALTER TABLE objects ADD COLUMN en_hash TEXT")
+        # Миграция: полный payload для планирования переносов (занятость залов)
+        if "content_payload" not in cols:
+            self._conn.execute("ALTER TABLE objects ADD COLUMN content_payload TEXT")
         
         # Миграция v2 -> v3: новые таблицы
         tables = {r["name"] for r in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -153,19 +157,55 @@ class State:
         row = self.get(entity, source_id)
         return int(row["target_id"]) if row else None
 
-    def upsert(self, entity: str, source_id: int, target_id: int, payload_hash: str) -> None:
+    def upsert(
+        self,
+        entity: str,
+        source_id: int,
+        target_id: int,
+        payload_hash: str,
+        payload: dict | None = None,
+    ) -> None:
+        """Подтвердить применённое состояние.
+
+        `payload` — полный последний подтверждённый payload: он нужен, чтобы
+        моделировать занятость залов при планировании переносов. Если payload
+        не передан, прежнее значение сохраняется (не затирается пустым).
+        """
         self._conn.execute(
             """
-            INSERT INTO objects(entity, source_id, target_id, content_hash, updated_at)
-            VALUES(?,?,?,?,datetime('now'))
+            INSERT INTO objects(entity, source_id, target_id, content_hash, content_payload, updated_at)
+            VALUES(?,?,?,?,?,datetime('now'))
             ON CONFLICT(entity, source_id) DO UPDATE SET
                 target_id=excluded.target_id,
                 content_hash=excluded.content_hash,
+                content_payload=COALESCE(excluded.content_payload, objects.content_payload),
                 updated_at=datetime('now')
             """,
-            (entity, source_id, target_id, payload_hash),
+            (
+                entity,
+                source_id,
+                target_id,
+                payload_hash,
+                json.dumps(payload, ensure_ascii=False) if payload is not None else None,
+            ),
         )
         self._conn.commit()
+
+    def get_payload(self, entity: str, source_id: int) -> dict | None:
+        """Полный подтверждённый payload объекта (None — не хранится/нет записи)."""
+        row = self.get(entity, source_id)
+        if row is None or row["content_payload"] is None:
+            return None
+        return json.loads(row["content_payload"])
+
+    def list_payloads(self, entity: str) -> dict[int, dict]:
+        """{source_id: payload} всех подтверждённых объектов данного типа."""
+        cur = self._conn.execute(
+            "SELECT source_id, content_payload FROM objects "
+            "WHERE entity=? AND content_payload IS NOT NULL",
+            (entity,),
+        )
+        return {int(r["source_id"]): json.loads(r["content_payload"]) for r in cur.fetchall()}
 
     def delete(self, entity: str, source_id: int) -> None:
         self._conn.execute(
@@ -333,6 +373,11 @@ class State:
         cur = self._conn.execute("SELECT * FROM temporary_halls WHERE hall_id=?", (hall_id,))
         row = cur.fetchone()
         return dict(row) if row else None
+
+    def list_temporary_halls(self) -> list[dict]:
+        """Все известные временные залы."""
+        cur = self._conn.execute("SELECT * FROM temporary_halls ORDER BY hall_id")
+        return [dict(r) for r in cur.fetchall()]
     
     def cleanup_temporary_halls(self) -> list[int]:
         """Удалить неиспользуемые временные залы. Возвращает список ID удалённых."""
@@ -342,3 +387,8 @@ class State:
             self._conn.execute("DELETE FROM temporary_halls WHERE hall_id=?", (hall_id,))
         self._conn.commit()
         return to_delete
+
+    def cleanup_temporary_halls_id(self, hall_id: int) -> None:
+        """Забыть один временный зал после его удаления через API."""
+        self._conn.execute("DELETE FROM temporary_halls WHERE hall_id=?", (hall_id,))
+        self._conn.commit()

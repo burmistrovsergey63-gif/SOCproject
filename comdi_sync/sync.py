@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from .config import Config
 from .eventicious import EventiciousClient, EventiciousError
 from .state import State, content_hash
+from .transfer import Occupancy, Placement
 
 log = logging.getLogger(__name__)
 
@@ -69,7 +70,7 @@ class Syncer:
         return stored is None or stored["content_hash"] != content_hash(payload)
 
     def _upsert(self, entity: str, source_id: int, target_id: int, payload: dict) -> None:
-        self.state.upsert(entity, source_id, target_id, content_hash(payload))
+        self.state.upsert(entity, source_id, target_id, content_hash(payload), payload)
 
     def _put_en(self, entity: str, target_id: int, payload: dict) -> None:
         body = {**payload, "language": "en-US"}
@@ -381,28 +382,80 @@ class Syncer:
     ) -> list[tuple[int, str]]:
         """Синхронизация эпизодов. Возвращает список упавших (source_id, ошибка).
 
-        Ошибка на одном эпизоде не должна ронять остальные 81 — поэтому
-        исключения собираются, а не пробрасываются наружу.
+        Порядок (ТЗ 7):
+        1) согласованные удаления — до переносов, чтобы слоты освобождались
+           в модели только после подтверждённого удаления;
+        2) контентные обновления (без смены зала/времени) — напрямую;
+        3) create и переносы — через планировщик с проверкой занятости и
+           разрывом циклов техническим временным залом;
+        4) очистка неиспользуемых технических залов.
+        Fallback «409 -> загрузить без зала» удалён по ТЗ: 409 вопреки модели
+        означает расхождение модели с сервером и фиксируется как ошибка.
         """
         mapping = dict(self.state.list_ids("session"))
         kept_sources: set[int] = set()
         failures: list[tuple[int, str]] = []
 
+        # 1) удаления исчезнувших эпизодов — до моделирования переносов
+        if self.cfg.delete_removed:
+            self._remove_missing("session", {ep.source_id for ep in schedule.all_episodes}, self.api.delete_session)
+
+        # 2) желаемые payload'ы (desired state по данным Comdi)
+        desired: dict[int, dict] = {}
+        en_payloads: dict[int, dict | None] = {}
         for ep in schedule.all_episodes:
             kept_sources.add(ep.source_id)
+            desired[ep.source_id] = self._session_body(ep, locations, tags, session_locations, users)
+            en_payloads[ep.source_id] = self._en_session_payload(ep)
+
+        # 3) модель занятости из applied state. Заодно добиваем payload у сессий,
+        #    чей хэш совпал с желаемым: совпадение хэша доказывает, что в
+        #    Eventicious ровно этот payload — baseline не выдумываем (ТЗ 10).
+        occupancy = Occupancy()
+        for sid, body in desired.items():
+            stored = self.state.get("session", sid)
+            if stored is None:
+                continue
+            if stored["content_hash"] == content_hash(body) and stored["content_payload"] is None:
+                self.state.upsert("session", sid, body["id"], content_hash(body), body)
+            payload = self.state.get_payload("session", sid)
+            if payload is not None:
+                occupancy.place(sid, Placement.from_payload(payload))
+
+        # 4) классификация: пропуск / контент-апдейт / перенос или create
+        content_updates: dict[int, dict] = {}
+        pending: dict[int, dict] = {}
+        for sid, body in desired.items():
+            stored = self.state.get("session", sid)
+            if stored is not None and stored["content_hash"] == content_hash(body):
+                # основной payload не менялся, но EN-версия могла не уйти раньше
+                self._sync_en("session", sid, body["id"], en_payloads[sid])
+                continue
+            applied = occupancy.placement_of(sid) if stored is not None else None
+            if applied is not None and applied == Placement.from_payload(body):
+                content_updates[sid] = body
+            else:
+                pending[sid] = body
+
+        # 5) контентные обновления: зал и время не меняются — конфликтов нет
+        for sid, body in content_updates.items():
             try:
-                self._sync_one_session(ep, mapping, locations, tags, session_locations, users)
+                self.api.update_session(body["id"], {k: v for k, v in body.items() if k != "id"})
             except EventiciousError as exc:
-                failures.append((ep.source_id, str(exc)))
-                log.error(
-                    "session %s не синхронизирована: %s [%s]",
-                    ep.source_id,
-                    ep.name_ru[:50],
-                    exc,
-                )
-            except Exception as exc:  # noqa: BLE001 — не даём одному эпизоду уронить прогон
-                failures.append((ep.source_id, repr(exc)))
-                log.exception("session %s: непредвиденная ошибка", ep.source_id)
+                failures.append((sid, str(exc)))
+                log.error("session %s не синхронизирована: %s", sid, exc)
+                continue
+            self._upsert("session", sid, body["id"], body)
+            mapping[sid] = body["id"]
+            log.info("session update: [%s] %s", sid, (body.get("title") or "")[:60])
+            self._sync_en("session", sid, body["id"], en_payloads[sid])
+
+        # 6) create и переносы — в безопасном порядке
+        if pending:
+            failures.extend(self._execute_planned(pending, occupancy, mapping, en_payloads))
+
+        # 7) технические залы больше не нужны — удаляем
+        self._cleanup_temp_halls(occupancy, failures)
 
         if failures:
             log.error(
@@ -411,67 +464,170 @@ class Syncer:
                 len(schedule.all_episodes),
                 [f[0] for f in failures],
             )
-
-        if self.cfg.delete_removed:
-            self._remove_missing("session", kept_sources, self.api.delete_session)
         return failures
 
-    def _sync_one_session(
+    def _execute_planned(
         self,
-        ep: Episode,
+        pending: dict[int, dict],
+        occupancy: Occupancy,
         mapping: dict[int, int],
-        locations: dict[int, int],
-        tags: dict[int, int],
-        session_locations: dict[int, int],
-        users: dict[int, int],
-    ) -> None:
-        body = self._session_body(ep, locations, tags, session_locations, users)
-        en_payload = self._en_session_payload(ep)
+        en_payloads: dict[int, dict | None],
+    ) -> list[tuple[int, str]]:
+        """Выполняет create/переносы в порядке, безопасном для занятости.
 
-        if not self._should_upsert("session", ep.source_id, body):
-            mapping[ep.source_id] = body["id"]
-            # основной payload не менялся, но EN-версия могла не уйти раньше
-            self._sync_en(
-                entity="session",
-                source_id=ep.source_id,
-                target_id=body["id"],
-                payload=en_payload,
-            )
+        Цикл переносов (А хочет слот Б, Б хочет слот А) разрывается уводом
+        одной сессии во временный технический зал. При ошибке шага зависимые
+        шаги не выполняются — applied state сохраняет место, где остановились,
+        и следующий прогон продолжит с этого же места (ТЗ 7.3).
+        """
+        failures: list[tuple[int, str]] = []
+        parked: set[int] = set()
+
+        while pending:
+            progressed = False
+            for sid in sorted(pending):
+                body = pending[sid]
+                target = Placement.from_payload(body)
+                if not occupancy.is_free(target, exclude={sid}):
+                    continue
+                exists = sid in mapping
+                try:
+                    self._push_session(body, exists)
+                except EventiciousError as exc:
+                    # 409 вопреки модели = расхождение модели с сервером; не
+                    # маскируем, останавливаем зависимые шаги (ТЗ 7.3)
+                    log.error(
+                        "session %s: перенос не применился (модель расходится с сервером): %s",
+                        sid,
+                        exc,
+                    )
+                    failures.append((sid, str(exc)))
+                    failures.extend(
+                        (other, "не выполнено: зависим от упавшего переноса")
+                        for other in sorted(pending)
+                        if other != sid
+                    )
+                    return failures
+                self._upsert("session", sid, body["id"], body)
+                occupancy.place(sid, target)
+                mapping[sid] = body["id"]
+                log.info(
+                    "session %s: [%s] -> зал %s (%s)",
+                    "create" if not exists else "move/update",
+                    sid,
+                    target.location_id,
+                    (body.get("title") or "")[:50],
+                )
+                self._sync_en("session", sid, body["id"], en_payloads.get(sid))
+                del pending[sid]
+                parked.discard(sid)
+                progressed = True
+
+            if progressed:
+                continue
+
+            # тупик — цикл переносов. Разрываем уводом одной сессии во временный зал.
+            candidates = [s for s in sorted(pending) if s in mapping and s not in parked]
+            if not candidates:
+                msg = "тупик: нет кандидатов для разрыва цикла переносов"
+                log.error("session %s: %s", sorted(pending), msg)
+                failures.extend((s, msg) for s in sorted(pending))
+                return failures
+            sid = candidates[0]
+            if not self._park_to_temp(sid, pending[sid], occupancy):
+                msg = "не удалось увести сессию во временный зал"
+                failures.append((sid, msg))
+                failures.extend(
+                    (other, "не выполнено: зависим от незавершённого переноса")
+                    for other in sorted(pending)
+                    if other != sid
+                )
+                return failures
+            parked.add(sid)
+
+        return failures
+
+    # смещение id для технических временных залов (обмен занятыми залами)
+    TEMP_HALL_BASE = 9_000_000
+    TEMP_HALL_POSITION = 999
+    TEMP_HALL_POOL = 5
+
+    def _temp_hall_candidates(self) -> list[int]:
+        return [self.TEMP_HALL_BASE + i for i in range(self.TEMP_HALL_POOL)]
+
+    def _ensure_temp_hall(self, temp_id: int) -> None:
+        """Создаёт технический зал однократно (идемпотентно через state)."""
+        if self.state.get_temporary_hall(temp_id) is not None:
             return
-
-        exists = ep.source_id in mapping
-        # зал для эпизода уже подобран планом _plan_halls — дубль создаётся заранее,
-        # поэтому 409 здесь означает, что планировщик что-то не учёл
+        body = {
+            "id": temp_id,
+            "position": self.TEMP_HALL_POSITION,
+            "name": f"Технический зал {temp_id}",
+        }
         try:
-            self._push_session(body, exists)
-            action = "update" if exists else "create"
+            self.api.create_location(body)  # при конфликте id сам уйдёт в update
         except EventiciousError as exc:
-            if exc.status != 409 or not body.get("locationsIds"):
-                raise
-            # страховка: планировщик не предвидел конфликт. Не теряем эпизод —
-            # грузим без зала и громко сообщаем, чтобы это поправили в данных Comdi
-            log.error(
-                "session %s: неожиданный 409 (планировщик не увидел пересечения). "
-                "Эпизод загружен БЕЗ зала, проверьте данные Comdi: %s [%s]",
-                ep.source_id,
-                ep.name_ru[:50],
-                exc,
+            log.error("Не удалось создать технический зал %s: %s", temp_id, exc)
+            raise
+        self.state.create_temporary_hall(temp_id, body["name"])
+        log.warning("Создан технический временный зал %s", temp_id)
+
+    def _park_to_temp(self, sid: int, final_body: dict, occupancy: Occupancy) -> bool:
+        """Уводит сессию во временный зал (разрыв цикла переносов).
+
+        Время сессии не меняется — только зал. Применённое промежуточное
+        состояние сохраняется, чтобы после сбоя продолжить с того же места.
+        """
+        start, end = final_body.get("startTime"), final_body.get("endTime")
+        for temp_id in self._temp_hall_candidates():
+            target = Placement(temp_id, start, end)
+            if not occupancy.is_free(target, exclude={sid}):
+                continue
+            try:
+                self._ensure_temp_hall(temp_id)
+            except EventiciousError:
+                return False
+            park_body = {**final_body, "locationsIds": [temp_id]}
+            try:
+                self.api.update_session(
+                    final_body["id"], {k: v for k, v in park_body.items() if k != "id"}
+                )
+            except EventiciousError as exc:
+                log.error("session %s: не удалось увести во временный зал: %s", sid, exc)
+                return False
+            self._upsert("session", sid, final_body["id"], park_body)
+            self.state.mark_temporary_hall_in_use(temp_id)
+            occupancy.place(sid, target)
+            log.warning(
+                "session %s: уведена во временный зал %s (разрыв цикла переносов)",
+                sid,
+                temp_id,
             )
-            body = {**body, "locationsIds": []}
-            self._push_session(body, exists)
-            action = "update" if exists else "create"
+            return True
+        log.error("session %s: нет свободного технического зала", sid)
+        return False
 
-        self._upsert("session", ep.source_id, body["id"], body)
-        mapping[ep.source_id] = body["id"]
-        log.info("session %s: [%s] %s", action, ep.source_id, ep.name_ru[:60])
-
-        # английская версия — отдельным PUT с language=en-US
-        self._sync_en(
-            entity="session",
-            source_id=ep.source_id,
-            target_id=body["id"],
-            payload=en_payload,
-        )
+    def _cleanup_temp_halls(self, occupancy: Occupancy, failures: list[tuple[int, str]]) -> None:
+        """Удаляет технические залы, в которых не осталось сессий (ТЗ 7.2 п.5)."""
+        for hall in self.state.list_temporary_halls():
+            temp_id = int(hall["hall_id"])
+            occupied = occupancy.sessions_in(temp_id)
+            if occupied:
+                log.warning(
+                    "Технический зал %s ещё занят сессиями %s — оставляем", temp_id, sorted(occupied)
+                )
+                continue
+            try:
+                self.api.delete_location(temp_id)
+            except EventiciousError as exc:
+                if exc.status == 404:
+                    pass  # уже удалён
+                else:
+                    failures.append((temp_id, f"очистка временного зала: {exc}"))
+                    log.error("Технический зал %s не удалён: %s", temp_id, exc)
+                    continue
+            self.state.cleanup_temporary_halls_id(temp_id)
+            log.info("Технический зал %s удалён", temp_id)
 
     def _push_session(self, body: dict, exists: bool) -> None:
         """Отправка эпизода: update для известного, create для нового."""
