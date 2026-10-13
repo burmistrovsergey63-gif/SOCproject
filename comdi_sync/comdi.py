@@ -102,6 +102,60 @@ def _as_list(value: Any) -> list:
     return []
 
 
+class SourceValidationError(RuntimeError):
+    """Ответ Comdi неполон или невалиден.
+
+    Отсутствие поля/неверный тип коллекции НЕ является подтверждением
+    исчезновения объектов (ТЗ 5): до выяснения нельзя выполнять удаления
+    и блокировки, поэтому такой ответ валится до начала любых операций.
+    """
+
+
+_MISSING = object()
+
+
+def validate_source(payload: Any) -> None:
+    """Проверка полноты и структуры выгрузки Comdi перед нормализацией.
+
+    Пустая, но корректная программа (пустые списки) — валидна и разрешает
+    удаления; отсутствие/типовая ошибка коллекций — SourceValidationError.
+    Также проверяется уникальность ID (ТЗ 5.3).
+    """
+    if not isinstance(payload, dict):
+        raise SourceValidationError(f"ответ Comdi не объект: {type(payload).__name__}")
+
+    stream = payload.get("stream", _MISSING)
+    if stream is _MISSING or not isinstance(stream, list):
+        raise SourceValidationError("в ответе Comdi нет полного списка 'stream'")
+    members = payload.get("members", _MISSING)
+    if members is _MISSING or not isinstance(members, list):
+        raise SourceValidationError("в ответе Comdi нет полного списка 'members'")
+
+    stream_ids: list[int] = []
+    ep_ids: list[int] = []
+    for st in stream:
+        if not isinstance(st, dict) or st.get("id") is None:
+            raise SourceValidationError("в 'stream' есть зал без id или не-объект")
+        stream_ids.append(int(st["id"]))
+        episodes = st.get("episode", _MISSING)
+        if episodes is _MISSING or not isinstance(episodes, list):
+            raise SourceValidationError(f"у зала {st['id']} нет полного списка 'episode'")
+        for ep in episodes:
+            if not isinstance(ep, dict) or ep.get("id") is None:
+                raise SourceValidationError(f"в зале {st['id']} есть эпизод без id или не-объект")
+            ep_ids.append(int(ep["id"]))
+
+    member_ids: list[int] = []
+    for m in members:
+        if not isinstance(m, dict) or m.get("id") is None:
+            raise SourceValidationError("в 'members' есть профиль без id или не-объект")
+        member_ids.append(int(m["id"]))
+
+    for label, ids in (("залов", stream_ids), ("эпизодов", ep_ids), ("спикеров", member_ids)):
+        if len(ids) != len(set(ids)):
+            raise SourceValidationError(f"дубликаты id {label} в выгрузке Comdi")
+
+
 class ComdiClient:
     def __init__(self, url: str, timeout: int = 30, max_retries: int = 4) -> None:
         self.url = url
@@ -139,6 +193,7 @@ def normalize(payload: dict) -> Schedule:
     ВАЖНО: у части залов `episode` приходит пустым массивом — это норма,
     зал всё равно должен попасть в систему.
     """
+    validate_source(payload)
     tags_by_id: dict[int, Tag] = {}
     halls: list[Hall] = []
     speakers: list[Speaker] = []

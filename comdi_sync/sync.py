@@ -58,10 +58,18 @@ class Syncer:
         self.tz = ZoneInfo(cfg.event_timezone)
         # счётчики реальных изменений за прогон — для Telegram-отчёта
         self.changes: dict[str, int] = {}
+        # ошибки/незавершённые операции всех шагов (залы, темы, EN, delete,
+        # block, очистка) — попадают в итоговый статус (ТЗ 11)
+        self.errors: list[str] = []
 
     def _bump(self, key: str, n: int = 1) -> None:
         if n:
             self.changes[key] = self.changes.get(key, 0) + n
+
+    def _error(self, msg: str) -> None:
+        """Зафиксировать ошибку шага: она обязана попасть в итог прогона."""
+        self.errors.append(msg)
+        log.error(msg)
 
     # ---------- вспомогательные ----------
 
@@ -110,6 +118,7 @@ class Syncer:
                 log.warning("%s %s: EN-версия, 404 — повторю позже", entity, source_id)
             else:
                 log.warning("%s %s: EN-версия не применилась: %s", entity, source_id, exc)
+            self._error(f"EN {entity} {source_id} не применён: {exc}")
             return
 
         self.state.mark_en_sent(entity, source_id, payload_hash)
@@ -198,6 +207,7 @@ class Syncer:
                         action = "create"
                 except EventiciousError as exc:
                     log.error("location %s не синхронизирован: %s", hall.description_ru, exc)
+                    self._error(f"location {hall.description_ru}: {exc}")
                     continue
 
                 self._upsert("location", hall.source_id, body["id"], body)
@@ -249,6 +259,7 @@ class Syncer:
                     action = "create"
             except EventiciousError as exc:
                 log.error("tag %s не синхронизирован: %s", body["name"], exc)
+                self._error(f"tag {body['name']}: {exc}")
                 continue
 
             self._upsert("tag", tag.source_id, body["id"], body)
@@ -300,11 +311,19 @@ class Syncer:
             }
             
             # Проверяем, нужно ли обновление
-            if not self._should_upsert("user", speaker.source_id, body):
+            was_blocked = self.state.is_blocked("user", speaker.source_id)
+            if not was_blocked and not self._should_upsert("user", speaker.source_id, body):
                 mapping[speaker.source_id] = target_id
                 continue
-            
-            batch.append(body)
+
+            # реактивация (ТЗ 9): вернувшийся спикер активируется тем же
+            # target_id без создания дубля; withdrawn уходит только в отправку,
+            # в applied state храним профиль без него (чтобы не зациклить diff)
+            if was_blocked:
+                batch.append({**body, "withdrawn": False})
+                log.info("user reactivate: source_id=%d -> target_id=%d", speaker.source_id, target_id)
+            else:
+                batch.append(body)
             batch_ids.append(speaker.source_id)
             
             # Отправляем батч по достижении 200 пользователей
@@ -316,11 +335,9 @@ class Syncer:
         # Отправляем оставшийся батч
         if batch:
             self._send_user_batch(batch, batch_ids, mapping)
-        
-        # Блокировка исчезнувших спикеров (если включено удаление)
-        if self.cfg.delete_removed:
-            self._block_missing_users(kept_sources, mapping)
-        
+
+        # Блокировка исчезнувших спикеров выполняется ПОСЛЕ синхронизации
+        # сессий (ТЗ 9: сначала снимаются связи сессий, затем блокировка).
         return mapping
     
     def _send_user_batch(self, batch: list[dict], source_ids: list[int], mapping: dict[int, int]) -> None:
@@ -343,39 +360,54 @@ class Syncer:
                 self.api.update_users({"users": existing_users})
                 for user in existing_users:
                     source_id = user["id"] - self.cfg.offset_user
-                    self._upsert("user", source_id, user["id"], user)
+                    # в applied state храним чистый профиль без служебного withdrawn
+                    profile = {k: v for k, v in user.items() if k != "withdrawn"}
+                    self._upsert("user", source_id, user["id"], profile)
                     mapping[source_id] = user["id"]
-                    self._bump("user_update")
+                    if user.get("withdrawn") is False:
+                        self.state.set_blocked("user", source_id, False)
+                        self._bump("user_reactivate")
+                        log.info("user reactivate applied: source_id=%d", source_id)
+                    else:
+                        self._bump("user_update")
                     log.info("user update: %s %s (source_id=%d)", user["firstName"], user["lastName"], source_id)
         
         except EventiciousError as exc:
             log.error("users batch sync failed: %s", exc)
+            self._error(f"users batch: {exc}")
     
     def _block_missing_users(self, kept_sources: set[int], mapping: dict[int, int]) -> None:
-        """Заблокировать спикеров, которых нет в новом списке Comdi."""
+        """Заблокировать спикеров, которых нет в новом полном списке Comdi.
+
+        Блокируется только уже управляемый профиль (из applied state);
+        повторная одинаковая выгрузка не шлёт block повторно (ТЗ 9),
+        ошибка block не сохраняет blocked.
+        """
         existing_users = self.state.list_ids("user")
         missing_sources = set(existing_users.keys()) - kept_sources
-        
+
         if not missing_sources:
             return
-        
-        # Блокируем через update с withdrawn=True
+
+        # Блокируем через update с withdrawn=True (не delete)
         to_block = []
         for source_id in missing_sources:
+            if self.state.is_blocked("user", source_id):
+                continue  # уже подтверждённо заблокирован — повтор не нужен
             target_id = existing_users[source_id]
             to_block.append({"id": target_id, "withdrawn": True})
             log.info("user block: source_id=%d -> target_id=%d", source_id, target_id)
-        
+
         if to_block:
             try:
                 self.api.update_users({"users": to_block})
-                self._bump("user_block", len(to_block))
-                for user in to_block:
-                    source_id = user["id"] - self.cfg.offset_user
-                    # Сохраняем информацию о блокировке в состоянии
-                    # (можно добавить поле blocked в objects таблицу)
             except EventiciousError as exc:
                 log.error("users block failed: %s", exc)
+                self._error(f"users block: {exc}")
+                return  # blocked не сохраняем: операция незавершена (ТЗ 9)
+            self._bump("user_block", len(to_block))
+            for user in to_block:
+                self.state.set_blocked("user", user["id"] - self.cfg.offset_user, True)
 
     @staticmethod
     def _en_session_payload(ep: Episode) -> dict | None:
@@ -667,6 +699,10 @@ class Syncer:
             "position": lane + 1,
             "name": f"{hall_name} ({lane + 1})",
         }
+        # ТЗ 6: не повторять отправку неизменного дубля — сверяемся с applied state
+        stored = self.state.get("location_dup", hall_source_id * 100 + lane)
+        if stored is not None and stored["content_hash"] == content_hash(body):
+            return dup_id
         try:
             self.api.create_location(body)  # при конфликте id сам уйдёт в update
         except EventiciousError as exc:
@@ -726,11 +762,20 @@ class Syncer:
             "aclGroupsIds": [],
             "type": 0,
         }
+        speaker_ids: list[int] = []
         if ep.speaker_ids and users:
             # Используем только спикеров, которые успешно синхронизированы
-            speaker_ids = [users.get(s) for s in ep.speaker_ids if s in users]
-            if speaker_ids:
-                body["speakersIds"] = speaker_ids
+            speaker_ids = [users[s] for s in ep.speaker_ids if s in users]
+        if speaker_ids:
+            body["speakersIds"] = speaker_ids
+        else:
+            # ТЗ 9: исчезновение последнего спикера сессии — явная очистка
+            # связей пустым массивом. Ключ держим стабильным: раз он уже был
+            # в applied state, desired всегда содержит его (иначе diff
+            # зациклится и update уйдёт каждый прогон).
+            prev = self.state.get_payload("session", ep.source_id)
+            if prev and "speakersIds" in prev:
+                body["speakersIds"] = []
         color = _color(ep.color)
         if color:
             body["color"] = color
@@ -752,11 +797,13 @@ class Syncer:
                     self.state.delete(entity, source_id)
                 else:
                     log.error("%s: не удалось удалить %s: %s", entity, source_id, exc)
+                    self._error(f"{entity} delete {source_id}: {exc}")
 
     # ---------- запуск ----------
 
     def run_once(self) -> dict[str, int]:
         self.changes = {}  # счётчики за текущий прогон
+        self.errors = []  # ошибки/незавершённые операции шагов за прогон
         schedule = self.comdi.fetch_schedule()
         # конфликты по времени считаем заранее по данным Comdi, а не по 409 от API
         plan = self._plan_halls(schedule)
@@ -767,13 +814,25 @@ class Syncer:
         users = self.sync_users(schedule)  # синхронизация спикеров
         failures = self.sync_sessions(schedule, locations, tags, session_locations, users)
 
+        # Блокировка исчезнувших спикеров — только после успешных изменений
+        # сессий (ТЗ 9): при ошибке зависимого шага откладываем и фиксируем.
+        if self.cfg.delete_removed:
+            kept_sources = {s.source_id for s in schedule.speakers}
+            if failures:
+                self._error(
+                    "блокировка спикеров отложена: есть незавершённые операции сессий"
+                )
+            else:
+                self._block_missing_users(kept_sources, users)
+
         stats = {
             "halls": len(schedule.halls),
             "tags": len(schedule.tags),
             "episodes": len(schedule.all_episodes),
             "users": len(schedule.speakers),
-            "failed": len(failures),
+            "failed": len(failures) + len(self.errors),
             "changes": dict(self.changes),
+            "errors": (self.errors + [f"session {sid}: {msg}" for sid, msg in failures])[:20],
         }
         if failures:
             log.error("Синхронизация завершена с ошибками: %s", stats)

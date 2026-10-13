@@ -71,6 +71,9 @@ RU_CHANGES = {
     "user_create": "создан спикер",
     "user_update": "обновлён спикер",
     "user_block": "заблокирован спикер",
+    "user_reactivate": "реактивирован спикер",
+    "location_delete": "удалён зал",
+    "tag_delete": "удалена тема",
     "temp_park": "увод во временный зал",
 }
 

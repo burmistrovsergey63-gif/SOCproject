@@ -95,7 +95,10 @@ class State:
         # Миграция: полный payload для планирования переносов (занятость залов)
         if "content_payload" not in cols:
             self._conn.execute("ALTER TABLE objects ADD COLUMN content_payload TEXT")
-        
+        # Миграция: флаг подтверждённой блокировки (ТЗ 9 — повтор отсутствия не повторяет block)
+        if "blocked" not in cols:
+            self._conn.execute("ALTER TABLE objects ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0")
+        self._conn.commit()
         # Миграция v2 -> v3: новые таблицы
         tables = {r["name"] for r in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if "desired_state" not in tables:
@@ -238,6 +241,19 @@ class State:
             "UPDATE objects SET en_hash=?, updated_at=datetime('now') "
             "WHERE entity=? AND source_id=?",
             (payload_hash, entity, source_id),
+        )
+        self._conn.commit()
+
+    def is_blocked(self, entity: str, source_id: int) -> bool:
+        """Подтверждённо заблокирован ли объект (ТЗ 9: повтор отсутствия не шлёт block повторно)."""
+        row = self.get(entity, source_id)
+        return bool(row and row["blocked"])
+
+    def set_blocked(self, entity: str, source_id: int, value: bool) -> None:
+        self._conn.execute(
+            "UPDATE objects SET blocked=?, updated_at=datetime('now') "
+            "WHERE entity=? AND source_id=?",
+            (1 if value else 0, entity, source_id),
         )
         self._conn.commit()
 
