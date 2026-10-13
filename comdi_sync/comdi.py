@@ -40,6 +40,31 @@ class Episode:
 
 
 @dataclass(frozen=True)
+class Speaker:
+    source_id: int
+    name_ru: str
+    name_en: str
+    lastname_ru: str
+    lastname_en: str
+    patronymic_ru: str
+    patronymic_en: str
+    company_ru: str
+    company_en: str
+    regalia_ru: str
+    regalia_en: str
+    description_ru: str
+    description_en: str
+    biography_ru: str
+    biography_en: str
+    link_telegram: str | None
+    link_vk: str | None
+    link_dzen: str | None
+    photo: str
+    photo_orig: str
+    hide: bool = False
+
+
+@dataclass(frozen=True)
 class Hall:
     source_id: int
     description_ru: str
@@ -54,6 +79,7 @@ class Schedule:
     event_name_en: str
     halls: tuple[Hall, ...]
     tags: tuple[Tag, ...]
+    speakers: tuple[Speaker, ...]
 
     @property
     def all_episodes(self) -> list[Episode]:
@@ -115,6 +141,39 @@ def normalize(payload: dict) -> Schedule:
     """
     tags_by_id: dict[int, Tag] = {}
     halls: list[Hall] = []
+    speakers: list[Speaker] = []
+
+    # Нормализация спикеров из members
+    for member in _as_list(payload.get("members")):
+        member_id = member.get("id")
+        if member_id is None:
+            continue
+        
+        speakers.append(
+            Speaker(
+                source_id=int(member_id),
+                name_ru=member.get("nameRu") or "",
+                name_en=member.get("nameEn") or "",
+                lastname_ru=member.get("lastnameRu") or "",
+                lastname_en=member.get("lastnameEn") or "",
+                patronymic_ru=member.get("patronymicRu") or "",
+                patronymic_en=member.get("patronymicEn") or "",
+                company_ru=member.get("companyRu") or "",
+                company_en=member.get("companyEn") or "",
+                regalia_ru=member.get("regaliaRu") or "",
+                regalia_en=member.get("regaliaEn") or "",
+                description_ru=member.get("descriptionRu") or "",
+                description_en=member.get("descriptionEn") or "",
+                biography_ru=member.get("biographyRu") or "",
+                biography_en=member.get("biographyEn") or "",
+                link_telegram=member.get("linkTelegram"),
+                link_vk=member.get("linkVk"),
+                link_dzen=member.get("linkDzen"),
+                photo=member.get("photo") or "",
+                photo_orig=member.get("photoOrig") or "",
+                hide=bool(member.get("hide", False)),
+            )
+        )
 
     for order, stream in enumerate(_as_list(payload.get("stream"))):
         stream_id = stream.get("id")
@@ -180,14 +239,16 @@ def normalize(payload: dict) -> Schedule:
         )
 
     log.info(
-        "Comdi: залов=%d, эпизодов=%d, тегов=%d",
+        "Comdi: залов=%d, эпизодов=%d, тегов=%d, спикеров=%d",
         len(halls),
         sum(len(h.episodes) for h in halls),
         len(tags_by_id),
+        len(speakers),
     )
     return Schedule(
         event_name_ru=payload.get("name_ru") or "",
         event_name_en=payload.get("name_en") or "",
         halls=tuple(halls),
         tags=tuple(sorted(tags_by_id.values(), key=lambda t: t.source_id)),
+        speakers=tuple(speakers),
     )

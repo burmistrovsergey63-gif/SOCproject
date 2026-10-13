@@ -1,17 +1,20 @@
-"""Локальное состояние синхронизации: маппинг source_id -> target_id + хэш содержимого.
+"""Локальное состояние синхронизации: три вида состояния по ТЗ.
 
-Нужно, потому что в Eventicious нет GET для расписания/залов/тегов —
-читать текущее состояние обратно невозможно. Всё, что мы создали, помним сами.
+1. Desired state - нормализованная выгрузка Comdi (актуальные данные источника)
+2. Applied state - последнее подтверждённое состояние в Eventicious
+3. Execution state - план выполнения операций с их статусами
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 _SCHEMA = """
+-- Applied state: последнее подтверждённое состояние в Eventicious
 CREATE TABLE IF NOT EXISTS objects (
     entity     TEXT NOT NULL,   -- 'location' | 'tag' | 'session' | 'user'
     source_id  INTEGER NOT NULL,-- id в Comdi
@@ -21,6 +24,43 @@ CREATE TABLE IF NOT EXISTS objects (
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (entity, source_id)
 );
+
+-- Desired state: нормализованная выгрузка Comdi
+CREATE TABLE IF NOT EXISTS desired_state (
+    run_id TEXT NOT NULL,
+    entity TEXT NOT NULL,
+    source_id INTEGER NOT NULL,
+    payload TEXT NOT NULL,  -- полный JSON payload
+    received_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (run_id, entity, source_id)
+);
+
+-- Execution state: план выполнения операций
+CREATE TABLE IF NOT EXISTS execution_plan (
+    run_id TEXT NOT NULL,
+    operation TEXT NOT NULL,  -- 'create' | 'update' | 'delete' | 'move' | 'block' | 'reactivate'
+    entity TEXT NOT NULL,
+    source_id INTEGER NOT NULL,
+    target_id INTEGER,
+    payload TEXT NOT NULL,
+    dependencies TEXT,  -- JSON массив зависимых operation_id
+    status TEXT NOT NULL DEFAULT 'pending',  -- 'pending' | 'running' | 'succeeded' | 'failed' | 'unknown'
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    PRIMARY KEY (run_id, operation, entity, source_id)
+);
+
+-- Временные залы для безопасного переноса сессий
+CREATE TABLE IF NOT EXISTS temporary_halls (
+    hall_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    in_use BOOLEAN NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (hall_id)
+);
+
+-- Журнал синхронизаций
 CREATE TABLE IF NOT EXISTS sync_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -46,10 +86,52 @@ class State:
         self._conn.commit()
 
     def _migrate(self) -> None:
-        """Добавляет колонки, появившиеся в более новых версиях схемы."""
+        """Миграция существующей схемы на новую версию."""
+        # Миграция v1 -> v2: добавление en_hash
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(objects)")}
         if "en_hash" not in cols:
             self._conn.execute("ALTER TABLE objects ADD COLUMN en_hash TEXT")
+        
+        # Миграция v2 -> v3: новые таблицы
+        tables = {r["name"] for r in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "desired_state" not in tables:
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS desired_state (
+                    run_id TEXT NOT NULL,
+                    entity TEXT NOT NULL,
+                    source_id INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    received_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (run_id, entity, source_id)
+                );
+            """)
+        if "execution_plan" not in tables:
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS execution_plan (
+                    run_id TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    entity TEXT NOT NULL,
+                    source_id INTEGER NOT NULL,
+                    target_id INTEGER,
+                    payload TEXT NOT NULL,
+                    dependencies TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    error TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    completed_at TEXT,
+                    PRIMARY KEY (run_id, operation, entity, source_id)
+                );
+            """)
+        if "temporary_halls" not in tables:
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS temporary_halls (
+                    hall_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    in_use BOOLEAN NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (hall_id)
+                );
+            """)
 
     def close(self) -> None:
         self._conn.close()
@@ -135,3 +217,128 @@ class State:
 
     def mark_alert(self, kind: str) -> None:
         self.log(f"alert:{kind}")
+
+    # ---------- Desired state (актуальная выгрузка Comdi) ----------
+    
+    def save_desired_state(self, run_id: str, entity: str, source_id: int, payload: dict) -> None:
+        """Сохранить объект из новой выгрузки Comdi."""
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO desired_state(run_id, entity, source_id, payload, received_at)
+            VALUES(?,?,?,?,datetime('now'))
+            """,
+            (run_id, entity, source_id, json.dumps(payload, ensure_ascii=False)),
+        )
+        self._conn.commit()
+    
+    def get_desired_state(self, run_id: str, entity: str) -> dict[int, dict]:
+        """Получить все объекты данного типа из выгрузки."""
+        cur = self._conn.execute(
+            "SELECT source_id, payload FROM desired_state WHERE run_id=? AND entity=?",
+            (run_id, entity)
+        )
+        return {int(r["source_id"]): json.loads(r["payload"]) for r in cur.fetchall()}
+    
+    def clear_desired_state(self, run_id: str) -> None:
+        """Очистить desired state для прогона."""
+        self._conn.execute("DELETE FROM desired_state WHERE run_id=?", (run_id,))
+        self._conn.commit()
+
+    # ---------- Execution state (план операций) ----------
+    
+    def create_execution_plan(self, run_id: str) -> None:
+        """Создать новый план выполнения."""
+        self._conn.execute("DELETE FROM execution_plan WHERE run_id=?", (run_id,))
+        self._conn.commit()
+    
+    def add_operation(
+        self,
+        run_id: str,
+        operation: str,
+        entity: str,
+        source_id: int,
+        target_id: int | None,
+        payload: dict,
+        dependencies: list[int] | None = None
+    ) -> int:
+        """Добавить операцию в план. Возвращает operation_id."""
+        op_id = hash(f"{run_id}{operation}{entity}{source_id}") % 1000000000
+        self._conn.execute(
+            """
+            INSERT INTO execution_plan(run_id, operation, entity, source_id, target_id, payload, dependencies, status, created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,'pending',datetime('now'))
+            """,
+            (run_id, operation, entity, source_id, target_id, json.dumps(payload, ensure_ascii=False),
+             json.dumps(dependencies) if dependencies else None),
+        )
+        self._conn.commit()
+        return op_id
+    
+    def update_operation_status(self, run_id: str, operation: str, entity: str, source_id: int, 
+                               status: str, error: str | None = None) -> None:
+        """Обновить статус операции."""
+        completed_at = "datetime('now')" if status in ('succeeded', 'failed', 'unknown') else None
+        self._conn.execute(
+            """
+            UPDATE execution_plan 
+            SET status=?, error=?, completed_at=?
+            WHERE run_id=? AND operation=? AND entity=? AND source_id=?
+            """,
+            (status, error, completed_at, run_id, operation, entity, source_id),
+        )
+        self._conn.commit()
+    
+    def get_operation_status(self, run_id: str, operation: str, entity: str, source_id: int) -> str:
+        """Получить статус операции."""
+        cur = self._conn.execute(
+            "SELECT status FROM execution_plan WHERE run_id=? AND operation=? AND entity=? AND source_id=?",
+            (run_id, operation, entity, source_id)
+        )
+        row = cur.fetchone()
+        return row["status"] if row else "pending"
+    
+    def get_running_operations(self, run_id: str) -> list:
+        """Получить незавершённые операции плана."""
+        cur = self._conn.execute(
+            "SELECT * FROM execution_plan WHERE run_id=? AND status IN ('pending', 'running')",
+            (run_id,)
+        )
+        return [dict(r) for r in cur.fetchall()]
+    
+    def clear_execution_plan(self, run_id: str) -> None:
+        """Очистить план выполнения."""
+        self._conn.execute("DELETE FROM execution_plan WHERE run_id=?", (run_id,))
+        self._conn.commit()
+
+    # ---------- Temporary halls (временные залы для переноса) ----------
+    
+    def create_temporary_hall(self, hall_id: int, name: str) -> None:
+        """Создать или получить временный зал."""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO temporary_halls(hall_id, name, in_use, created_at) VALUES(?,?,0,datetime('now'))",
+            (hall_id, name),
+        )
+        self._conn.commit()
+    
+    def mark_temporary_hall_in_use(self, hall_id: int, in_use: bool = True) -> None:
+        """Отметить временный зал как используемый или свободный."""
+        self._conn.execute(
+            "UPDATE temporary_halls SET in_use=? WHERE hall_id=?",
+            (in_use, hall_id),
+        )
+        self._conn.commit()
+    
+    def get_temporary_hall(self, hall_id: int) -> dict | None:
+        """Получить информацию о временном зале."""
+        cur = self._conn.execute("SELECT * FROM temporary_halls WHERE hall_id=?", (hall_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+    
+    def cleanup_temporary_halls(self) -> list[int]:
+        """Удалить неиспользуемые временные залы. Возвращает список ID удалённых."""
+        cur = self._conn.execute("SELECT hall_id FROM temporary_halls WHERE in_use=0")
+        to_delete = [r[0] for r in cur.fetchall()]
+        for hall_id in to_delete:
+            self._conn.execute("DELETE FROM temporary_halls WHERE hall_id=?", (hall_id,))
+        self._conn.commit()
+        return to_delete

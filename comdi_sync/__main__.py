@@ -82,6 +82,7 @@ def cmd_dry(cfg, comdi) -> int:
     # в dry-run маппинга ещё нет, но ID детерминированы (source_id + offset)
     fake_locations = {h.source_id: h.source_id + cfg.offset_location for h in schedule.halls}
     fake_tags = {t.source_id: t.source_id + cfg.offset_tag for t in schedule.tags}
+    fake_users = {s.source_id: s.source_id + cfg.offset_user for s in schedule.speakers}
     # конфликты по времени считаем и в dry — чтобы заранее увидеть дубли залов
     plan = syncer._plan_halls(schedule)
     fake_lane_map = {
@@ -125,8 +126,18 @@ def cmd_dry(cfg, comdi) -> int:
             }
             for t in schedule.tags
         ],
+        "users": [
+            {
+                "id": s.source_id + cfg.offset_user,
+                "firstName": s.name_ru,
+                "lastName": s.lastname_ru,
+                "company": s.company_ru,
+                "position": s.regalia_ru,
+            }
+            for s in schedule.speakers
+        ],
         "sessions": [
-            syncer._session_body(ep, fake_locations, fake_tags, fake_session_locations)
+            syncer._session_body(ep, fake_locations, fake_tags, fake_session_locations, fake_users)
             for ep in schedule.all_episodes
         ],
     }

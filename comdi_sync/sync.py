@@ -10,7 +10,8 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .comdi import Episode, Schedule, Tag
+from .comdi import Episode, Schedule, Speaker, Tag
+from dataclasses import dataclass
 from .config import Config
 from .eventicious import EventiciousClient, EventiciousError
 from .state import State, content_hash
@@ -257,6 +258,113 @@ class Syncer:
         self._remove_missing("tag", kept_sources, self.api.delete_tag)
         return mapping
 
+    def sync_users(self, schedule: Schedule) -> dict[int, int]:
+        """Синхронизация спикеров/участников.
+
+        Returns:
+            mapping source_id -> target_id
+        """
+        mapping = dict(self.state.list_ids("user"))
+        kept_sources: set[int] = set()
+        
+        # Массовое создание/обновление (максимум 200 за запрос)
+        batch: list[dict] = []
+        batch_ids: list[int] = []
+        
+        for speaker in schedule.speakers:
+            kept_sources.add(speaker.source_id)
+            target_id = speaker.source_id + self.cfg.offset_user
+            
+            # Формируем payload по контракту Eventicious
+            body: dict[str, Any] = {
+                "id": target_id,
+                "firstName": speaker.name_ru or "",
+                "lastName": speaker.lastname_ru or "",
+                "company": speaker.company_ru or "",
+                "position": speaker.regalia_ru or "",
+                "description": _plain_to_html(speaker.description_ru or speaker.biography_ru or ""),
+                "telegram": speaker.link_telegram or "",
+                "vk": speaker.link_vk or "",
+                "socialMediaLink1": speaker.link_dzen or "",
+                "externalImagePath": speaker.photo_orig or speaker.photo or "",
+                "isSpeaker": True,
+            }
+            
+            # Проверяем, нужно ли обновление
+            if not self._should_upsert("user", speaker.source_id, body):
+                mapping[speaker.source_id] = target_id
+                continue
+            
+            batch.append(body)
+            batch_ids.append(speaker.source_id)
+            
+            # Отправляем батч по достижении 200 пользователей
+            if len(batch) >= 200:
+                self._send_user_batch(batch, batch_ids, mapping)
+                batch = []
+                batch_ids = []
+        
+        # Отправляем оставшийся батч
+        if batch:
+            self._send_user_batch(batch, batch_ids, mapping)
+        
+        # Блокировка исчезнувших спикеров (если включено удаление)
+        if self.cfg.delete_removed:
+            self._block_missing_users(kept_sources, mapping)
+        
+        return mapping
+    
+    def _send_user_batch(self, batch: list[dict], source_ids: list[int], mapping: dict[int, int]) -> None:
+        """Отправить батч пользователей (create/update)."""
+        try:
+            # Определяем, create или update
+            new_users = [u for u in batch if source_ids[batch.index(u)] not in mapping]
+            existing_users = [u for u in batch if source_ids[batch.index(u)] in mapping]
+            
+            if new_users:
+                self.api.create_users({"users": new_users})
+                for user in new_users:
+                    source_id = user["id"] - self.cfg.offset_user
+                    self._upsert("user", source_id, user["id"], user)
+                    mapping[source_id] = user["id"]
+                    log.info("user create: %s %s (source_id=%d)", user["firstName"], user["lastName"], source_id)
+            
+            if existing_users:
+                self.api.update_users({"users": existing_users})
+                for user in existing_users:
+                    source_id = user["id"] - self.cfg.offset_user
+                    self._upsert("user", source_id, user["id"], user)
+                    mapping[source_id] = user["id"]
+                    log.info("user update: %s %s (source_id=%d)", user["firstName"], user["lastName"], source_id)
+        
+        except EventiciousError as exc:
+            log.error("users batch sync failed: %s", exc)
+    
+    def _block_missing_users(self, kept_sources: set[int], mapping: dict[int, int]) -> None:
+        """Заблокировать спикеров, которых нет в новом списке Comdi."""
+        existing_users = self.state.list_ids("user")
+        missing_sources = set(existing_users.keys()) - kept_sources
+        
+        if not missing_sources:
+            return
+        
+        # Блокируем через update с withdrawn=True
+        to_block = []
+        for source_id in missing_sources:
+            target_id = existing_users[source_id]
+            to_block.append({"id": target_id, "withdrawn": True})
+            log.info("user block: source_id=%d -> target_id=%d", source_id, target_id)
+        
+        if to_block:
+            try:
+                self.api.update_users({"users": to_block})
+                for user in to_block:
+                    source_id = user["id"] - self.cfg.offset_user
+                    # Сохраняем информацию о блокировке в состоянии
+                    # (можно добавить поле blocked в objects таблицу)
+            except EventiciousError as exc:
+                log.error("users block failed: %s", exc)
+
     @staticmethod
     def _en_session_payload(ep: Episode) -> dict | None:
         if not (ep.name_en or ep.info_en):
@@ -269,6 +377,7 @@ class Syncer:
         locations: dict[int, int],
         tags: dict[int, int],
         session_locations: dict[int, int],
+        users: dict[int, int],
     ) -> list[tuple[int, str]]:
         """Синхронизация эпизодов. Возвращает список упавших (source_id, ошибка).
 
@@ -282,7 +391,7 @@ class Syncer:
         for ep in schedule.all_episodes:
             kept_sources.add(ep.source_id)
             try:
-                self._sync_one_session(ep, mapping, locations, tags, session_locations)
+                self._sync_one_session(ep, mapping, locations, tags, session_locations, users)
             except EventiciousError as exc:
                 failures.append((ep.source_id, str(exc)))
                 log.error(
@@ -314,8 +423,9 @@ class Syncer:
         locations: dict[int, int],
         tags: dict[int, int],
         session_locations: dict[int, int],
+        users: dict[int, int],
     ) -> None:
-        body = self._session_body(ep, locations, tags, session_locations)
+        body = self._session_body(ep, locations, tags, session_locations, users)
         en_payload = self._en_session_payload(ep)
 
         if not self._should_upsert("session", ep.source_id, body):
@@ -422,12 +532,15 @@ class Syncer:
         locations: dict[int, int],
         tags: dict[int, int],
         session_locations: dict[int, int] | None = None,
+        users: dict[int, int] | None = None,
     ) -> dict[str, Any]:
         """Собирает payload эпизода.
 
         `session_locations` = {ep_source_id: location_id} — куда именно грузить
         эпизод (учтены дубли залов). Если маппинга нет (dry-run без плана) —
         берём основной зал из `locations`.
+        
+        `users` = {source_id: target_id} — маппинг спикеров
         """
         location_id = (session_locations or {}).get(ep.source_id)
         if location_id is None:
@@ -443,8 +556,11 @@ class Syncer:
             "aclGroupsIds": [],
             "type": 0,
         }
-        if ep.speaker_ids:
-            body["speakersIds"] = [s + self.cfg.offset_user for s in ep.speaker_ids]
+        if ep.speaker_ids and users:
+            # Используем только спикеров, которые успешно синхронизированы
+            speaker_ids = [users.get(s) for s in ep.speaker_ids if s in users]
+            if speaker_ids:
+                body["speakersIds"] = speaker_ids
         color = _color(ep.color)
         if color:
             body["color"] = color
@@ -476,12 +592,14 @@ class Syncer:
         # сводим к «куда грузить каждый эпизод» — одна плоская карта без путаницы ключей
         session_locations = self._flatten_locations(plan, lane_map)
         tags = self.sync_tags(schedule)
-        failures = self.sync_sessions(schedule, locations, tags, session_locations)
+        users = self.sync_users(schedule)  # синхронизация спикеров
+        failures = self.sync_sessions(schedule, locations, tags, session_locations, users)
 
         stats = {
             "halls": len(schedule.halls),
             "tags": len(schedule.tags),
             "episodes": len(schedule.all_episodes),
+            "users": len(schedule.speakers),
             "failed": len(failures),
         }
         if failures:
