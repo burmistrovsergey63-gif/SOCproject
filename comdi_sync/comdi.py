@@ -209,6 +209,22 @@ def normalize(payload: dict) -> Schedule:
                 for s in _as_list(ep.get("speakers"))
                 if (isinstance(s, dict) and s.get("id") is not None) or isinstance(s, int)
             ]
+            # Основная привязка спикеров в Comdi — через groups с ролями
+            # («Спикер», «Модератор»); поле speakers у эпизодов часто пустое.
+            if not speaker_ids:
+                seen: set[int] = set()
+                for group in _as_list(ep.get("groups")):
+                    role = (group.get("role") or {}).get("titleRu") or ""
+                    if role and role != "Спикер":
+                        continue  # модераторы и прочие роли — не спикеры
+                    for gm in _as_list(group.get("members")):
+                        member = gm.get("member") if isinstance(gm, dict) else None
+                        mid = member.get("id") if isinstance(member, dict) else None
+                        if mid is None and isinstance(gm, dict):
+                            mid = gm.get("id")
+                        if mid is not None and int(mid) not in seen:
+                            seen.add(int(mid))
+                            speaker_ids.append(int(mid))
 
             episodes.append(
                 Episode(

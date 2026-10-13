@@ -59,13 +59,61 @@ def _notify_failure(cfg, state, kind: str, message: str) -> None:
         state.mark_alert(kind)
 
 
+RU_CHANGES = {
+    "location_create": "создан зал",
+    "location_update": "обновлён зал",
+    "tag_create": "создана тема",
+    "tag_update": "обновлена тема",
+    "session_create": "создана сессия",
+    "session_update": "обновлена сессия",
+    "session_move": "перенесена сессия",
+    "session_delete": "удалена сессия",
+    "user_create": "создан спикер",
+    "user_update": "обновлён спикер",
+    "user_block": "заблокирован спикер",
+    "temp_park": "увод во временный зал",
+}
+
+
+def _changes_text(changes: dict) -> str:
+    """Счётчики изменений -> компактный человекочитаемый список."""
+    parts = []
+    for key, label in RU_CHANGES.items():
+        n = changes.get(key)
+        if n:
+            parts.append(f"{label}: {n}")
+    return "\n".join(f"  • {p}" for p in parts) if parts else "  (мелкие правки)"
+
+
+def _notify_changes(cfg, state, stats: dict) -> None:
+    """Отчёт об обновлениях расписания. Молчит, если изменений не было.
+
+    В отличие от ошибок, дубликатов здесь нет по построению: отчёт уходит
+    только когда applied state реально изменился.
+    """
+    changes = stats.get("changes") or {}
+    if not changes:
+        return
+    notifier = TelegramNotifier(cfg.telegram_bot_token, cfg.telegram_chat_id)
+    if not notifier.enabled:
+        return
+    text = (
+        f"🔄 <b>Comdi → Eventicious: расписание обновлено</b>\n"
+        f"Время (UTC): {datetime.now(timezone.utc):%Y-%m-%d %H:%M}\n\n"
+        f"{_changes_text(changes)}\n"
+    )
+    notifier.send(text)
+
+
 def cmd_once(cfg, syncer, state) -> int:
     try:
         stats = syncer.run_once()
         state.log("ok" if not stats.get("failed") else "partial", json.dumps(stats, ensure_ascii=False))
-        # частичный результат — тоже сигнал ненулевого кода для cron/мониторинга
+        # ошибки — с анти-спамом; обновления — только при реальных изменениях
         if stats.get("failed"):
             _notify_failure(cfg, state, "partial", f"Часть объектов не синхронизировалась: {stats}")
+        else:
+            _notify_changes(cfg, state, stats)
         return 1 if stats.get("failed") else 0
     except Exception as exc:  # noqa: BLE001 — фиксируем любой сбой и отдаём ненулевой код
         log.exception("Синхронизация не удалась")

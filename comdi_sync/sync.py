@@ -56,6 +56,12 @@ class Syncer:
         self.api = api
         self.state = state
         self.tz = ZoneInfo(cfg.event_timezone)
+        # счётчики реальных изменений за прогон — для Telegram-отчёта
+        self.changes: dict[str, int] = {}
+
+    def _bump(self, key: str, n: int = 1) -> None:
+        if n:
+            self.changes[key] = self.changes.get(key, 0) + n
 
     # ---------- вспомогательные ----------
 
@@ -196,6 +202,7 @@ class Syncer:
 
                 self._upsert("location", hall.source_id, body["id"], body)
                 mapping[hall.source_id] = body["id"]
+                self._bump(f"location_{action}")
                 log.info("location %s: %s (%s)", action, hall.description_ru, body["id"])
 
             # дорожки >0 = дубли зала, нужны для эпизодов с пересечением времени
@@ -246,6 +253,7 @@ class Syncer:
 
             self._upsert("tag", tag.source_id, body["id"], body)
             mapping[tag.source_id] = body["id"]
+            self._bump(f"tag_{action}")
             log.info("tag %s: %s", action, body["name"])
 
             # английская версия — отдельным PUT с language=en-US
@@ -328,6 +336,7 @@ class Syncer:
                     source_id = user["id"] - self.cfg.offset_user
                     self._upsert("user", source_id, user["id"], user)
                     mapping[source_id] = user["id"]
+                    self._bump("user_create")
                     log.info("user create: %s %s (source_id=%d)", user["firstName"], user["lastName"], source_id)
             
             if existing_users:
@@ -336,6 +345,7 @@ class Syncer:
                     source_id = user["id"] - self.cfg.offset_user
                     self._upsert("user", source_id, user["id"], user)
                     mapping[source_id] = user["id"]
+                    self._bump("user_update")
                     log.info("user update: %s %s (source_id=%d)", user["firstName"], user["lastName"], source_id)
         
         except EventiciousError as exc:
@@ -359,6 +369,7 @@ class Syncer:
         if to_block:
             try:
                 self.api.update_users({"users": to_block})
+                self._bump("user_block", len(to_block))
                 for user in to_block:
                     source_id = user["id"] - self.cfg.offset_user
                     # Сохраняем информацию о блокировке в состоянии
@@ -447,6 +458,7 @@ class Syncer:
                 continue
             self._upsert("session", sid, body["id"], body)
             mapping[sid] = body["id"]
+            self._bump("session_update")
             log.info("session update: [%s] %s", sid, (body.get("title") or "")[:60])
             self._sync_en("session", sid, body["id"], en_payloads[sid])
 
@@ -511,6 +523,7 @@ class Syncer:
                 self._upsert("session", sid, body["id"], body)
                 occupancy.place(sid, target)
                 mapping[sid] = body["id"]
+                self._bump("session_create" if not exists else "session_move")
                 log.info(
                     "session %s: [%s] -> зал %s (%s)",
                     "create" if not exists else "move/update",
@@ -598,6 +611,7 @@ class Syncer:
             self._upsert("session", sid, final_body["id"], park_body)
             self.state.mark_temporary_hall_in_use(temp_id)
             occupancy.place(sid, target)
+            self._bump("temp_park")
             log.warning(
                 "session %s: уведена во временный зал %s (разрыв цикла переносов)",
                 sid,
@@ -731,6 +745,7 @@ class Syncer:
             try:
                 deleter(target_id)
                 self.state.delete(entity, source_id)
+                self._bump(f"{entity}_delete")
                 log.info("%s: удалён исчезнувший объект %s (target_id=%s)", entity, source_id, target_id)
             except EventiciousError as exc:
                 if exc.status == 404:
@@ -741,6 +756,7 @@ class Syncer:
     # ---------- запуск ----------
 
     def run_once(self) -> dict[str, int]:
+        self.changes = {}  # счётчики за текущий прогон
         schedule = self.comdi.fetch_schedule()
         # конфликты по времени считаем заранее по данным Comdi, а не по 409 от API
         plan = self._plan_halls(schedule)
@@ -757,6 +773,7 @@ class Syncer:
             "episodes": len(schedule.all_episodes),
             "users": len(schedule.speakers),
             "failed": len(failures),
+            "changes": dict(self.changes),
         }
         if failures:
             log.error("Синхронизация завершена с ошибками: %s", stats)
