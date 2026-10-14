@@ -20,11 +20,22 @@ from datetime import datetime, timedelta, timezone
 from .comdi import ComdiClient
 from .config import load_config, setup_logging
 from .eventicious import EventiciousClient
-from .notify import TelegramNotifier
+from .notify import GitHubWorkflowNotifier, TelegramNotifier
 from .state import State
 from .sync import Syncer
 
 log = logging.getLogger("comdi_sync")
+
+
+def _notification_notifier(cfg):
+    if cfg.github_actions_token and os.environ.get("GITHUB_ACTIONS") != "true":
+        return GitHubWorkflowNotifier(
+            cfg.github_actions_token,
+            cfg.github_notify_repository,
+            cfg.github_notify_workflow,
+            cfg.github_notify_ref,
+        )
+    return TelegramNotifier(cfg.telegram_bot_token, cfg.telegram_chat_id)
 
 
 def _alert_allowed(state, kind: str, cooldown_hours: int) -> bool:
@@ -41,7 +52,7 @@ def _alert_allowed(state, kind: str, cooldown_hours: int) -> bool:
 
 def _notify_failure(cfg, state, kind: str, message: str) -> None:
     """Отправить уведомление в Telegram (если настроено) и отметить его в state."""
-    notifier = TelegramNotifier(cfg.telegram_bot_token, cfg.telegram_chat_id)
+    notifier = _notification_notifier(cfg)
     if not notifier.enabled:
         return
     if not _alert_allowed(state, kind, cfg.alert_cooldown_hours):
@@ -97,7 +108,7 @@ def _notify_changes(cfg, state, stats: dict) -> None:
     changes = stats.get("changes") or {}
     if not changes:
         return
-    notifier = TelegramNotifier(cfg.telegram_bot_token, cfg.telegram_chat_id)
+    notifier = _notification_notifier(cfg)
     if not notifier.enabled:
         return
     text = (

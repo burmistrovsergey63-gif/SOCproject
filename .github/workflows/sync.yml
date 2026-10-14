@@ -1,10 +1,7 @@
 name: comdi → eventicious sync
 
 on:
-  schedule:
-    # каждые 15 минут, по гринвичу (UTC)
-    - cron: "*/15 * * * *"
-  workflow_dispatch: {} # ручной запуск из вкладки Actions
+  workflow_dispatch: {} # manual only; production schedule is on Selectel
 
 # один прогон за раз, без параллельных дублей
 concurrency:
