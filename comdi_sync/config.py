@@ -60,6 +60,16 @@ class Config:
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
+    # GitHub Actions relay used by the Selectel cron.
+    github_actions_token: str = os.getenv("GITHUB_ACTIONS_TOKEN", "")
+    github_notify_repository: str = os.getenv(
+        "GITHUB_NOTIFY_REPOSITORY", "burmistrovsergey63-gif/SOCproject"
+    )
+    github_notify_workflow: str = os.getenv(
+        "GITHUB_NOTIFY_WORKFLOW", "telegram-notify.yml"
+    )
+    github_notify_ref: str = os.getenv("GITHUB_NOTIFY_REF", "main")
+
     state_db: str = os.getenv("STATE_DB", "sync_state.sqlite3")
 
     http_timeout: int = _env_int("HTTP_TIMEOUT", 30)
