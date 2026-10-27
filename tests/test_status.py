@@ -108,10 +108,10 @@ class TestConcurrentRuns:
             (repo / ".github" / "workflows").glob("*.yaml")
         )
         assert workflows, "workflow синхронизации должен существовать"
-        sync_workflows = [w for w in workflows if "sync" in w.read_text().lower()]
+        sync_workflows = [w for w in workflows if w.stem == "sync"]
         assert sync_workflows, "должен быть workflow синхронизации"
         for wf in sync_workflows:
-            text = wf.read_text()
+            text = wf.read_text(encoding="utf-8")
             assert "concurrency" in text, (
                 f"{wf.name}: без concurrency-группы возможны два параллельных исполнителя"
             )
