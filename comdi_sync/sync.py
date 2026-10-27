@@ -293,7 +293,7 @@ class Syncer:
         
         for speaker in schedule.speakers:
             kept_sources.add(speaker.source_id)
-            target_id = speaker.source_id + self.cfg.offset_user
+            target_id = mapping.get(speaker.source_id, speaker.source_id + self.cfg.offset_user)
             
             # Формируем payload по контракту Eventicious
             body: dict[str, Any] = {
@@ -342,6 +342,7 @@ class Syncer:
     
     def _send_user_batch(self, batch: list[dict], source_ids: list[int], mapping: dict[int, int]) -> None:
         """Отправить батч пользователей (create/update)."""
+        source_by_target = {user["id"]: source_id for user, source_id in zip(batch, source_ids)}
         try:
             # Определяем, create или update
             new_users = [u for u in batch if source_ids[batch.index(u)] not in mapping]
@@ -350,7 +351,7 @@ class Syncer:
             if new_users:
                 self.api.create_users({"users": new_users})
                 for user in new_users:
-                    source_id = user["id"] - self.cfg.offset_user
+                    source_id = source_by_target[user["id"]]
                     self._upsert("user", source_id, user["id"], user)
                     mapping[source_id] = user["id"]
                     self._bump("user_create")
@@ -359,7 +360,7 @@ class Syncer:
             if existing_users:
                 self.api.update_users({"users": existing_users})
                 for user in existing_users:
-                    source_id = user["id"] - self.cfg.offset_user
+                    source_id = source_by_target[user["id"]]
                     # в applied state храним чистый профиль без служебного withdrawn
                     profile = {k: v for k, v in user.items() if k != "withdrawn"}
                     self._upsert("user", source_id, user["id"], profile)
@@ -390,24 +391,30 @@ class Syncer:
             return
 
         # Блокируем через update с withdrawn=True (не delete)
+        active_targets = {target_id for source_id, target_id in mapping.items() if source_id in kept_sources}
+        block_sources = []
         to_block = []
         for source_id in missing_sources:
             if self.state.is_blocked("user", source_id):
                 continue  # уже подтверждённо заблокирован — повтор не нужен
             target_id = existing_users[source_id]
+            if target_id in active_targets:
+                continue
+            block_sources.append(source_id)
             to_block.append({"id": target_id, "withdrawn": True})
             log.info("user block: source_id=%d -> target_id=%d", source_id, target_id)
 
-        if to_block:
+        for offset in range(0, len(to_block), 200):
+            batch = to_block[offset:offset + 200]
             try:
-                self.api.update_users({"users": to_block})
+                self.api.update_users({"users": batch})
             except EventiciousError as exc:
                 log.error("users block failed: %s", exc)
                 self._error(f"users block: {exc}")
                 return  # blocked не сохраняем: операция незавершена (ТЗ 9)
-            self._bump("user_block", len(to_block))
-            for user in to_block:
-                self.state.set_blocked("user", user["id"] - self.cfg.offset_user, True)
+            self._bump("user_block", len(batch))
+            for source_id in block_sources[offset:offset + 200]:
+                self.state.set_blocked("user", source_id, True)
 
     @staticmethod
     def _en_session_payload(ep: Episode) -> dict | None:
